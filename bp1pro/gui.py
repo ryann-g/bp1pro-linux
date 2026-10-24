@@ -21,6 +21,7 @@ gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk
 
 from . import device, protocol, telemetry
+from .gui_tray import TrayMixin
 from .transport import BaseTransport, MockTransport, RfcommTransport, TransportError
 
 log = logging.getLogger(__name__)
@@ -33,7 +34,7 @@ SIDES = ("left", "right", "both")
 ON_DONE = Callable[[str, list[str], Optional[str]], None]
 
 
-class Gui(Gtk.Window):
+class Gui(TrayMixin, Gtk.Window):
     """Main window — menu of controls + TX/RX log."""
 
     def __init__(self, mock: bool = False) -> None:
@@ -45,6 +46,8 @@ class Gui(Gtk.Window):
         self.config = self._load_config()
         self._busy = False
         self._auto_connect_attempted = False
+        self.tray = None  # StatusNotifierItem icon; built at end of init
+        self._tray_retry = 0
         self._pending: Optional[tuple[str, list[tuple[str, str | None]]]] = None
         self._after_conn: Optional[tuple[str, Optional[int]]] = None
         # GLib source id of the post-connect status poll (battery refresher)
@@ -99,6 +102,7 @@ class Gui(Gtk.Window):
         self.statusmsg("starting…")
         GLib.idle_add(lambda: (self._refresh_devices_async(), False)[1])
         self.connect("destroy", self._on_destroy)
+        self._make_tray()
 
     # -- pages ------------------------------------------------------------
 
@@ -360,6 +364,7 @@ class Gui(Gtk.Window):
         self.batt_lbl.set_text(
             f"Battery: L {pct(self.batt['left'])} · R {pct(self.batt['right'])}"
             f" · case {pct(self.batt['case'])}")
+        self._tray_render()
 
     # -- low-battery desktop alerts -----------------------------------------
 
@@ -402,9 +407,12 @@ class Gui(Gtk.Window):
             finally:
                 self.tr = None
         self.statusmsg("disconnected")
+        self._tray_render()
 
     def _on_destroy(self, *_args: object) -> None:
         self._close_link()
+        if self.tray is not None:
+            self.tray.stop()
 
     # -- async worker pattern ----------------------------------------------
 
@@ -450,6 +458,7 @@ class Gui(Gtk.Window):
                 # polls fail quietly (buds away / link gone)
                 self.statusmsg(f"{label}: error")
                 self.notify_error(f"{label} failed: {error}")
+            self._tray_render()
             return
         self._auto_reconnecting = False
         for f in frames:
@@ -465,6 +474,7 @@ class Gui(Gtk.Window):
                 self.statusmsg(f"{label} — done")
         # continuation work queued by the connect flow: runs here, after
         # _busy cleared, so its status burst cannot be dropped as "busy"
+        self._tray_render()
         after, self._after_conn = self._after_conn, None
         if after:
             self._after_connect(*after)
@@ -529,6 +539,9 @@ class Gui(Gtk.Window):
                 if mode in (0, 1, 2) \
                         and self.spatial_combo.get_active_id() != str(mode):
                     self.spatial_combo.set_active_id(str(mode))
+        # ANC/8D radio sync above feeds the tray menu labels
+        if self.tray is not None:
+            self._tray_render()
 
     # -- actions -----------------------------------------------------------
 

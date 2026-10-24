@@ -19,6 +19,10 @@ bud / charging case. The GUI also watches the battery for you: desktop
 notifications when a source runs low, and it quietly re-connects when buds
 come back into range.
 
+**Panel icon too:** while the GUI runs there is a BP1 Pro icon in the system
+tray area of the top panel (Zorin AppIndicators / KDE / XFCE …) with the
+battery list, ANC and 8D cycling, reconnect and quit — no extra setup.
+
 ## Install
 
 ```sh
@@ -81,6 +85,11 @@ Window sketch (the Log tab fills with live `TX`/`RX` lines like these):
 - Python 3.10+ — **standard library only** for the CLI/TUI/library (no pip
   packages); the GTK3 desktop app additionally needs `python3-gi`, which
   GNOME systems have preinstalled (`apt install python3-gi` otherwise)
+- The panel tray icon uses `python3-dbus` and whatever StatusNotifier host
+  your desktop runs (on Zorin that is the preinstalled "Zorin AppIndicators"
+  shell extension; GNOME without it: `sudo apt install
+  gnome-shell-extension-appindicator`). If either is absent the GUI simply
+  runs without the panel icon.
 - Earbuds paired once with the machine; music keeps flowing over the normal
   A2DP path (PipeWire/PulseAudio controls volume); this tool talks on the
   SPP link the buds expose alongside the audio.
@@ -317,6 +326,8 @@ bp1pro/
   cli.py         argument-driven commands
   tui.py         curses terminal UI
   gui.py         GTK3 desktop app (bp1pro-gui / app-grid entry)
+  gui_tray.py    tray glue mixin mixed into the GTK app
+  tray.py        StatusNotifierItem (AppIndicator) item + dbusmenu, dbus-python
   __main__.py    python -m bp1pro
 tests/           unittest suites + pty smoke
 ```
