@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Baseus BP1 Pro Control
+Comment=ANC / EQ / gestures control for Baseus Bass BP1 Pro earbuds (unofficial)
+Exec=%%HOME%%/.local/bin/bp1pro-gui
+Icon=bp1pro
+Terminal=false
+Categories=Utility;
+StartupWMClass=bp1pro-gui
+Keywords=baseus;bp1;earbuds;bluetooth;anc;noise;
