@@ -7,6 +7,7 @@ and status text respond. Skips silently when no display is available.
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -50,6 +51,17 @@ class GuiSmoke(unittest.TestCase):
         batt = app.batt_lbl.get_text()
         self.assertIn("L 100%", batt)
         self.assertIn("case 100%", batt)
+        # low-battery alerts: checkbutton present, active by default, and the
+        # alert logic fires notify-send for a fresh low reading
+        self.assertTrue(hasattr(app, "batt_alerts_check"))
+        self.assertTrue(app.batt_alerts_check.get_active())
+        with mock.patch.object(guimod.Gui, "_desktop_notify") as note:
+            app.batt = {"left": 10, "right": 80, "case": 100}
+            app._battery_check()
+            self.assertEqual(note.call_count, 1)  # left only
+            # hysteresis: same low value does not fire again
+            app._battery_check()
+            self.assertEqual(note.call_count, 1)
         # ANC handler writes 2 frames in ONE logged batch
         app.anc_combo.set_active_id("1")
         app.on_anc()

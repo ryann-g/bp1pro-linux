@@ -1,7 +1,7 @@
 """Command-line front end: python -m bp1pro <cmd> [args] [-a MAC] [--mock|].
 
-Subcommands: status, pair, connect, anc, eq, inear, mode, gesture,
-gesture-q, send, monitor, tui.
+Subcommands: status, pair, connect, anc, eq, eq-custom, eq-name, inear, mode,
+gesture, gesture-q, send, monitor, tui.
 
 MAC address: give it after the subcommand, via -a/--address, or set
 $BP1PRO_ADDR. Mock mode (--mock) drives a fake earbud for demos/tests.
@@ -16,6 +16,7 @@ import sys
 from typing import Callable, Optional
 
 from . import device, protocol
+from . import telemetry
 from .transport import BaseTransport, MockTransport, RfcommTransport, TransportError
 
 log = logging.getLogger(__name__)
@@ -147,6 +148,14 @@ def cmd_mode(args: argparse.Namespace) -> int:
 
 
 def cmd_gesture(args: argparse.Namespace) -> int:
+    if args.function is None:
+        # list mode: the firmware function ids bindable to clicks
+        print("bindable gesture function ids (protocol.FUNCTIONS):")
+        for fid, label in sorted(protocol.FUNCTIONS.items()):
+            print(f"  {fid:5d}  {label}")
+        print("usage: bp1pro gesture <click> <side> <id>"
+              "   e.g. bp1pro gesture double both 16")
+        return 0
     frame = protocol.gesture_set(args.click, args.function, args.side)
     with _transport(args) as tr:
         print("TX", frame)
@@ -158,6 +167,25 @@ def cmd_gesture_query(args: argparse.Namespace) -> int:
     with _transport(args) as tr:
         print("TX", f"BA21{args.button:02X}")
         _announce(tr.exchange(protocol.gesture_query(args.button)))
+        return 0
+
+
+def cmd_eq_custom(args: argparse.Namespace) -> int:
+    def _nums(text: str, cast=float) -> list:
+        return [cast(x.strip()) for x in text.split(",") if x.strip()]
+
+    try:
+        frame = protocol.eq_custom(
+            _nums(args.gain),
+            freqs=_nums(args.freq, float) if args.freq else None,
+            qs=_nums(args.q, float) if args.q else None,
+            filt=args.filter, slot_id=args.slot)
+    except ValueError as exc:
+        print("invalid eq-custom arguments:", exc)
+        return 1
+    with _transport(args) as tr:
+        print("TX", frame, f"({(len(frame) - 4) // 2} bytes after BA31)")
+        _announce(tr.exchange(frame, expect="AA30"))
         return 0
 
 
@@ -173,11 +201,35 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 
 def cmd_monitor(args: argparse.Namespace) -> int:
-    with _transport(args) as tr:
-        print("monitoring", args.addr, "- Ctrl+C to stop")
-        while True:
-            for frame in tr.exchange(protocol.anc_query(), timeout=3.0):
-                print("  RX", frame, "-", protocol.decode(frame), flush=True)
+    import json
+
+    state: dict = {}
+    csvfh = None
+    if args.csv:
+        csvfh = open(args.csv, "a", encoding="utf-8")
+        csvfh.write(telemetry.csv_header() + "\n")
+        csvfh.flush()
+        print(f"appending battery rows to {args.csv}")
+    try:
+        with _transport(args) as tr:
+            print("monitoring", args.addr, "- Ctrl+C to stop")
+            while True:
+                frames = tr.exchange(protocol.anc_query(), timeout=3.0)
+                state = telemetry.fold_frames(state, frames)
+                rec = telemetry.battery_record(state)
+                if rec.get("left") is not None or rec.get("case") is not None:
+                    if args.csv and csvfh is not None:
+                        csvfh.write(telemetry.csv_row(rec) + "\n")
+                        csvfh.flush()
+                    if args.json:
+                        print(json.dumps(rec), flush=True)
+                    else:
+                        for frame in frames:
+                            print("  RX", frame, "-", protocol.decode(frame),
+                                  flush=True)
+    finally:
+        if csvfh is not None:
+            csvfh.close()
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
@@ -252,19 +304,38 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("mode", "low-latency audio mode on/off (BA24)", cmd_mode)
     p.add_argument("setting", nargs="?", choices=("on", "off"))
 
-    p = add("gesture", "bind function to a click", cmd_gesture)
-    p.add_argument("click", choices=sorted(protocol.CLICK_OPS))
-    p.add_argument("side", choices=("left", "right", "both"))
-    p.add_argument("function", type=_HEX,
-                   help="id, e.g. 1=play/pause 3=next 6=ANC 7=spatial")
+    p = add("gesture", "bind function to a click (no args: list functions)",
+            cmd_gesture)
+    p.add_argument("click", nargs="?", choices=sorted(protocol.CLICK_OPS))
+    p.add_argument("side", nargs="?", choices=("left", "right", "both"),
+                   default=None)
+    p.add_argument("function", nargs="?", type=_HEX, default=None,
+                   help="id, e.g. 1=play/pause 3=next 6=ANC 7=spatial"
+                        " 13=bass 16=dynamic sound")
 
+    p = add("eq-custom", "upload a custom 8-band EQ (BA31 + band payload)",
+            cmd_eq_custom)
+    p.add_argument("--gain", required=True,
+                   help="8 dB values, comma list, −12..+12"
+                        " e.g. 3,-3,0,0,0,0,2,5")
+    p.add_argument("--freq", help="8 Hz values (default 100..10000 plan)")
+    p.add_argument("--q", help="8 q factors (default 1.0)")
+    p.add_argument("--slot", type=_HEX, default=8,
+                   help="custom-EQ slot id (default 8)")
+    p.add_argument("--filter", type=_HEX, default=1,
+                   help="filter type byte (default 1)")
     p = add("gesture-q", "query a button's config (BA21)", cmd_gesture_query)
     p.add_argument("button", type=_HEX)
 
     p = add("send", "send raw hex frame", cmd_send)
     p.add_argument("hex_", metavar="HEX")
 
-    add("monitor", "poll and print incoming frames", cmd_monitor)
+    p = add("monitor", "poll and print incoming frames (--json/--csv sinks)",
+            cmd_monitor)
+    p.add_argument("--json", action="store_true",
+                   help="emit one JSON battery record per poll")
+    p.add_argument("--csv", metavar="PATH",
+                   help="append timestamped battery rows to a CSV file")
     add("tui", "full-screen terminal UI", cmd_tui)
     return parser
 

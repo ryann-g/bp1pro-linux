@@ -11,19 +11,22 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import subprocess
 import threading
+import time
 from typing import Callable, Optional
 
 import gi  # noqa: F401
 gi.require_version("Gtk", "3.0")
 from gi.repository import GLib, Gtk
 
-from . import device, protocol
+from . import device, protocol, telemetry
 from .transport import BaseTransport, MockTransport, RfcommTransport, TransportError
 
 log = logging.getLogger(__name__)
 
 CONFIG_PATH = pathlib.Path.home() / ".config" / "bp1pro.json"
+AUTO_RECONNECT_SECS = 30.0  # quiet reconnect cadence when the link drops
 CLICKS = ("single", "double", "triple", "long")
 SIDES = ("left", "right", "both")
 
@@ -48,6 +51,12 @@ class Gui(Gtk.Window):
         self._poll_tag: Optional[int] = None
         # last-known battery percentages; AA27 (case) is push-only
         self.batt = {"left": None, "right": None, "case": None}
+        # low-battery alert state (hysteresis, protocol.LowBatteryAlerts)
+        self._alerts = telemetry.LowBatteryAlerts()
+        # auto-reconnect scheduling: attempt a quiet reconnect at most every
+        # AUTO_RECONNECT_SECS while the GUI keeps ticking without a link
+        self._next_reconn_ts = 0.0
+        self._auto_reconnecting = False
 
         header = Gtk.HeaderBar(title="Baseus BP1 Pro Control",
                                subtitle=self.config.get("addr", "not set"))
@@ -125,6 +134,14 @@ class Gui(Gtk.Window):
         self.batt_lbl = Gtk.Label()
         self._render_battery()
         box.pack_start(self.batt_lbl, False, False, 0)
+
+        # desktop low-battery alerts (notify-send), hysteresis-aware
+        self.batt_alerts_check = Gtk.CheckButton(
+            label="Low battery desktop alerts")
+        self.batt_alerts_check.set_active(self.config.get(
+            "batt_alerts", True))
+        self.batt_alerts_check.connect("toggled", lambda w: self._save_config())
+        box.pack_start(self.batt_alerts_check, False, False, 0)
 
         quit_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         close_link = Gtk.Button(label="Disconnect & close link")
@@ -326,6 +343,8 @@ class Gui(Gtk.Window):
         if not isinstance(data, dict):
             data = {}
         data.update(self.config)
+        if hasattr(self, "batt_alerts_check"):
+            data["batt_alerts"] = self.batt_alerts_check.get_active()
         CONFIG_PATH.write_text(json.dumps(data, indent=1))
 
     # -- helper widgets & plumbing -----------------------------------------
@@ -341,6 +360,34 @@ class Gui(Gtk.Window):
         self.batt_lbl.set_text(
             f"Battery: L {pct(self.batt['left'])} · R {pct(self.batt['right'])}"
             f" · case {pct(self.batt['case'])}")
+
+    # -- low-battery desktop alerts -----------------------------------------
+
+    def _battery_check(self) -> None:
+        """Fire notify-send alerts for sources crossing the low threshold.
+
+        ``LowBatteryAlerts`` is hysteresis-aware: one alert per drop, re-armed
+        only after the level climbs back above threshold + 10.
+        """
+        if not self.batt_alerts_check.get_active():
+            return
+        labels = {"left": "Left earbud", "right": "Right earbud",
+                  "case": "Charging case"}
+        for kind, value in self._alerts.update(self.batt):
+            self._desktop_notify(
+                "BP1 Pro battery low",
+                f"{labels[kind]} at {value}% - charge soon")
+            self.append_log(f"! low battery: {labels[kind]} {value}%")
+
+    @staticmethod
+    def _desktop_notify(title: str, body: str) -> None:
+        """Fire a desktop notification; failures are logged, never fatal."""
+        try:
+            subprocess.Popen(
+                ["notify-send", "-a", "BP1 Pro Control", title, body],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            log.warning("notify-send failed: %s", exc)
 
     def append_log(self, line: str) -> None:
         self.log_buffer.insert(self.log_buffer.get_end_iter(), line + "\n")
@@ -391,11 +438,20 @@ class Gui(Gtk.Window):
                  error: Optional[str], quiet: bool = False) -> None:
         self._busy = False
         if error:
-            self.append_log(f"!! {label}: {error}")
-            if not quiet:  # polls fail quietly (buds away / link gone)
+            # an auto-reconnect attempt failed: log it, never banner
+            auto_attempt = (self._auto_reconnecting
+                            and label.startswith("connecting"))
+            self._auto_reconnecting = False
+            if auto_attempt:
+                self.append_log(f".. auto-reconnect: {error}")
+            else:
+                self.append_log(f"!! {label}: {error}")
+            if not quiet and not auto_attempt:
+                # polls fail quietly (buds away / link gone)
                 self.statusmsg(f"{label}: error")
                 self.notify_error(f"{label} failed: {error}")
             return
+        self._auto_reconnecting = False
         for f in frames:
             if protocol.is_frame(f):
                 self.append_log(f"RX {f}  ({protocol.decode(f)})")
@@ -448,6 +504,7 @@ class Gui(Gtk.Window):
                 except ValueError:
                     continue
                 self._render_battery()
+                self._battery_check()
                 self.statusmsg(f"battery: left {self.batt['left']}% · "
                                f"right {self.batt['right']}%")
             elif frame.startswith("AA27") and len(frame) >= 6:
@@ -456,6 +513,7 @@ class Gui(Gtk.Window):
                 except ValueError:
                     continue
                 self._render_battery()
+                self._battery_check()
             elif frame.startswith("AA30") and len(frame) >= 6:
                 try:
                     self.eq_combo.set_active_id(str(int(frame[4:6], 16)))
@@ -512,6 +570,20 @@ class Gui(Gtk.Window):
         self.statusmsg("connecting… (takes a few seconds — keep buds worn)")
         self._async(f"connecting {addr}", self._do_connect(addr, channel))
 
+    # -- auto-reconnect ------------------------------------------------------
+
+    def _attempt_reconnect(self) -> None:
+        """Quietly reopen the last link; errors are logged, not bannered."""
+        if self._busy:
+            return  # dialogue busy — the next tick re-checks
+        addr = self.addr_combo.get_active_text() or self.config.get("addr")
+        if not addr:
+            return
+        if self.mock_switch.get_active():
+            return  # mock links never drop silently
+        self._auto_reconnecting = True
+        self._async(f"connecting {addr}", self._do_connect(addr, None))
+
     def _do_connect(self, addr: str, channel: Optional[int]) -> Callable[[],
                     list[str]]:
 
@@ -562,8 +634,14 @@ class Gui(Gtk.Window):
     def _poll_tick(self) -> bool:
         """Quiet status poll: reads buffered pushes, refreshes mirrors."""
         if self.tr is None or not self.tr.connected:
-            self._poll_tag = None
-            return False  # self-cancel; the next successful connect restarts
+            # keep this source alive: quietly reopen the link at most every
+            # AUTO_RECONNECT_SECS so buds returning to range reconnect on
+            # their own; connect errors are logged, not bannered
+            now = time.monotonic()
+            if not self._busy and now >= self._next_reconn_ts:
+                self._next_reconn_ts = now + AUTO_RECONNECT_SECS
+                self._attempt_reconnect()
+            return True
         if self._busy:
             return True  # an action owns the dialogue — skip this beat
         self._send_many("autorefresh", [

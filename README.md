@@ -13,8 +13,11 @@ Pair your buds normally; **audio always flows over the standard A2DP path**
 the part Linux was missing: the vendor switches.
 
 **What it controls:** ANC (mode + strength), EQ presets with editable names,
-8D / spatial sound (music / cinema), in-ear detect, low-latency game mode,
-gesture bindings, live battery for left bud / right bud / charging case.
+custom 8-band EQ uploads, 8D / spatial sound (music / cinema), in-ear detect,
+low-latency game mode, gesture bindings, live battery for left bud / right
+bud / charging case. The GUI also watches the battery for you: desktop
+notifications when a source runs low, and it quietly re-connects when buds
+come back into range.
 
 ## Install
 
@@ -131,12 +134,32 @@ bp1pro inear on              # in-ear detect auto-pause on
 bp1pro mode on               # low-latency audio mode  (BA2401)
 bp1pro gesture double left 3 # double-click(L) = next track (BA2203 03 FF)
 bp1pro gesture single both 6 # single-click(L+R) = ANC cycle (BA2201 06 06)
+bp1pro gesture               # list all bindable gesture function ids
 bp1pro gesture-q 0           # read button 0 config    (BA21 00)
 bp1pro send BA39             # raw hex frame at the protocol level
 bp1pro monitor               # poll & print incoming frames (^C to stop)
+bp1pro monitor --json        # one JSON battery record per poll
+bp1pro monitor --csv bat.csv # append timestamped battery rows to a CSV file
+bp1pro eq-custom \
+    --gain 3,-3,0,0,0,0,2,5  # upload a custom 8-band EQ (BA31 08 <bands>)
+bp1pro eq-custom --gain 0,0,6,-2,0,0,0,0 \
+    --freq 100,200,400,800,1000,3000,6000,10000 \
+    --q 1.0 --slot 8         # explicit band plan: freq (Hz), q, slot
 bp1pro tui                   # the terminal UI above
 bp1pro --mock status         # demo without hardware
 ```
+
+`eq-custom` band layout (derived from `EarEqSelfDefinePresenter.G():155`,
+`A()`/`B()`): 8 bands × 8 bytes — `freq` u16 little-endian (Hz), `gain` u16 LE
+as `int(dB×10 + 120)` i.e. −12..+12 dB → `0x00..0xF0` with 0 dB = `0x78`,
+`q` u16 LE as `int(q×10)` (1.0 → `0x0A`), filter byte `1` + `00`.
+Gains must be within −12..+12 dB. Each upload ends with the device ack
+`AA30 <slot>`; failure variants `00` (device unresponsive), `0C` (connect
+both buds first) and `0D` (cannot set during a call) are decoded too.
+
+While `monitor` is running the buds push their battery (`AA02`) and the GUI
+pushes desktop notifications when a source drops below 25% (re-armed after it
+climbs back above 35 — hysteresis, so hovering percentages don't spam).
 
 Gesture click set: `single` / `double` / `triple` / `long`; side:
 `left` / `right` / `both`; function ids below (any decimal or 0xN).
@@ -176,7 +199,8 @@ on this model family. Extracted from the app's decompiled sources
 | transport         | RFCOMM/SPP `00001101` **client** connect on channel **1** (live-verified 2026-10-24) | app is a client: `ClassicBtConnectManager.java:163`, `SppConnector.java:73/82` use `createRfcommSocketToServiceRecord`; no `listenUsingRfcomm*` anywhere in the app |
 | ANC query         | `BA33` → `AA33 <mode> <level>` | `NoiseReduceDataModel.java:909`; reply layout `NoiseReducePopWindow.T()` (substring offsets 4-6/6-8) |
 | ANC set           | `BA34 <mode> <level|FF>` → `AA34 01` ok / `AA34 0C 0D 00` fail reasons | `NoiseReduceDataModel.java:930`; ack handling + error toasts `NoiseReducePopWindow.java:585, 871-942` |
-| EQ select         | `BA31 <id>` → `AA30 <id>` | `EarEqDefaultRegulationPresenter.java:346,369`; reply `startsWith("AA30")` |
+| EQ select         | `BA31 <id>` → `AA30 <id>` (fail variant `AA30 00/0C/0D` = unresponsive / connect both buds / in a call) | select: `EarEqDefaultRegulationPresenter.java:346,369`; failure codes `EarEqDefaultRegulationActivityNewUi.java:880-905` |
+| EQ custom upload  | `BA31 <slot> <bands…>` — 8 bands × 8 B: freq u16-LE (Hz), gain u16-LE `int(dB×10+120)` (−12..+12 dB, 0 dB=0x78), q u16-LE `int(q×10)`, filter `%02X`+`"00"`; slot suffix `""` for non-"Baseus Storm 1" models | `EarEqSelfDefinePresenter.G():155` + `A()`/`B()` + `C()` (default 100..10 kHz plan, `EqRegulationConstant.DefineSelf.f34059a`); quick-select frames `BA3103/07/0D` also seen from app toggles (`EarPodNewActivity.java:4060,6088`) — **implemented, not yet live-verified** |
 | EQ preset names   | *not on the wire* — cloud config (`EqSoundModeBean {dictSort,label}`); this repo keeps a local editable map in `~/.config/bp1pro.json` (key `eq_names`) | `EarEqDefaultRegulationPresenter.f():105-110`; no catalog JSON in the APK assets (grep-verified) |
 | case battery      | `AA27 <q>` — **push only, no query frame exists in the app** | `HomeBleDataResolvePresenter.c0():1045-1053` reads `substring(4,6)`; `EarphoneFunctionShowFragmentNewUI.t()` — `AA276400` = case 100% |
 | battery push      | `AA02 <L> 00 <R> 01` (earbud battery left/right) | `BleUtils.d()` regex `AA02([xx])00([xx])01` — verified live: `AA0264006401` = 100/100; raw-socket evidence: pushed **unsolicited ~1.5 s after SPP link opens** (`AA02`,`AA27`,`AA3001` burst), not in reply to any query |
@@ -244,9 +268,11 @@ themselves (kernel log shows `rfkill: input handler …` toggles). Every
 connect in this tool first runs a best-effort unblock + power-on, so the app
 survives that — the Log tab notes the repair.
 
-### Unknown / extra frames (battery %, custom EQ bands, spatial audio…)
+### Unknown / extra frames
 
-Anything the app sends beyond this set can be discovered with an Android
+Custom EQ band uploads turned out to be visible in the app sources after all —
+see the `EQ custom upload` row above (jadx-derived, pending a live round-trip).
+Anything the app sends beyond that set can be discovered with an Android
 Bluetooth HCI snoop log: Developer settings enable the capture, use the app's
 wanted feature, then read `/sdcard/btsnoop_hci.log` and look for RFCOMM frame
 payloads (`BA…` writes, `AA…` reads for this family). Feed found frames
@@ -285,6 +311,7 @@ exercises the full menu loop including prompts.
 ```
 bp1pro/
   protocol.py    frame builders + reply parser/decoder (pure, no I/O)
+  telemetry.py   battery fold + records + low-battery alert logic (pure)
   transport.py   RFCOMM transport: channel scan, exchanges, mock transport
   device.py      bluetoothctl wrappers (pair/connect/status/ensure_connected)
   cli.py         argument-driven commands

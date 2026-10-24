@@ -268,5 +268,68 @@ class EqNames(unittest.TestCase):
                     "EQ ack: preset 1 selected (Rock)")
 
 
+class EqAckFailures(unittest.TestCase):
+    """AA30 carry failure codes in the same byte
+    (EarEqDefaultRegulationActivityNewUi.java:880-905)."""
+
+    def test_failure_codes(self):
+        self.assertIn("retry", protocol.decode("AA3000").lower())
+        self.assertIn("both buds", protocol.decode("AA300C"))
+        self.assertIn("call", protocol.decode("AA300D"))
+
+    def test_normal_preset_unchanged(self):
+        self.assertEqual(protocol.decode("AA3002"),
+                         "EQ ack: preset 2 selected (preset 2)")
+
+
+class EqCustom(unittest.TestCase):
+    """BA31 8-band custom-EQ upload frame (EarEqSelfDefinePresenter.G():155,
+    band encoder A()/B(), EqRegulationConstant.DefineSelf.f34059a)."""
+
+    def test_full_golden_frame(self):
+        frame = protocol.eq_custom(gains=[3, -3, 0, 0, 0, 0, 2, 5])
+        self.assertEqual(frame,
+            "BA31" "08"          # opcode + slot id
+            "640096000A000100"   # 100 Hz, +3 dB, q 1.0, filter 1
+            "C8005A000A000100"   # 200 Hz, -3 dB
+            "900178000A000100"   # 400 Hz, 0 dB (0 dB = 0x78)
+            "200378000A000100"   # 800 Hz, 0 dB
+            "E80378000A000100"   # 1 kHz, 0 dB
+            "B80B78000A000100"   # 3 kHz, 0 dB
+            "70178C000A000100"   # 6 kHz, +2 dB
+            "1027AA000A000100")  # 10 kHz, +5 dB
+
+    def test_zero_gains_default_plan(self):
+        frame = protocol.eq_custom(gains=[0.0] * 8)
+        self.assertEqual(frame[:6], "BA3108")
+        self.assertEqual(frame[6:22], "640078000A000100")  # 100 Hz, 0 dB
+        self.assertEqual(frame[-16:], "102778000A000100")  # 10 kHz, 0 dB
+        self.assertEqual(len(frame), 6 + 8 * 16)           # 8 bands x 8 B
+
+    def test_alternate_plan_q_and_slot(self):
+        frame = protocol.eq_custom(
+            gains=[0.0] * 8, freqs=[65, 125, 250, 500, 1000, 2000, 5000, 12000],
+            qs=[1.2, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], slot_id=1)
+        self.assertEqual(frame[:6], "BA3101")
+        self.assertEqual(frame[6:38],
+                         "410078000C000100"    # 65 Hz, q 1.2 (0x0C)
+                         "7D00780008000100")   # 125 Hz, q 0.8 (0x08)
+
+    def test_filter_and_slot_255(self):
+        frame = protocol.eq_custom(gains=[0.0] * 8, filt=2, slot_id=255)
+        self.assertEqual(frame[:6], "BA31FF")
+        self.assertEqual(frame.count("0200"), 8)  # filter bytes per band
+
+    def test_value_guards(self):
+        with self.assertRaises(ValueError):  # wrong band count
+            protocol.eq_custom([0.0] * 9)
+        with self.assertRaises(ValueError):  # gain out of range
+            protocol.eq_custom([-13.0] + [0.0] * 7)
+        with self.assertRaises(ValueError):  # freq list wrong length
+            protocol.eq_custom([0.0] * 8, freqs=[100] * 7)
+        with self.assertRaises(ValueError):  # q list wrong length
+            protocol.eq_custom([0.0] * 8, qs=[1.0] * 7)
+
+
 if __name__ == "__main__":
     unittest.main()

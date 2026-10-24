@@ -161,9 +161,47 @@ def anc_set(mode: int, level: int | None = None) -> str:
 def eq_select(preset_id: int) -> str:
     """Select EQ preset (or bands when device supports custom param later).
 
-    Reply: AA30 <id>. (EarEqDefaultRegulationPresenter.java:346/369)
+    Reply: AA30 <id>. Failures arrive in the same byte:
+    0C = connect both buds, 0D = cannot set during a call, 00 = generic fail
+    (EarEqDefaultRegulationActivityNewUi.java:880-905).
+    (EarEqDefaultRegulationPresenter.java:346/369)
     """
     return "BA31" + _hex(preset_id)
+
+
+# --- custom EQ (8-band upload) ---------------------------------------------
+# EarEqSelfDefinePresenter.G():155 builds "BA31 %02X(id) <suffix> <bands>"
+# where <suffix> is "" for non-"Baseus Storm 1" models and the band block
+# comes from A() + B() — 8 bands x 8 bytes:
+#   freq   u16 little-endian        (Hz; DefineSelf.f34059a default 100..
+#                                   10k, f34062d = 65..12k on some models)
+#   gain   u16 LE int(gain*10+120)  (−12..+12 dB -> 0x00..0xF0; 0 dB = 0x78)
+#   q      u16 LE int(q*10)         (q 1.0 -> 10)
+#   filter %02X + "00"               (1.0 -> "0100")
+def eq_custom(gains: list[float], freqs: list[int] | None = None,
+              qs: list[float] | None = None, filt: int = 1,
+              slot_id: int = 8) -> str:
+    """Upload an 8-band custom EQ into slot ``slot_id`` (app uses dictSort).
+
+    ``gains`` in dB (−12..+12). Defaults: the app's default frequency plan
+    100/200/400/800/1000/3000/6000/10000 Hz, q 1.0, filter 1.
+    Reply: AA30 <slot> (select-ack; failures 00/0C/0D as for ``eq_select``).
+    """
+    default_freqs = [100, 200, 400, 800, 1000, 3000, 6000, 10000]
+    freqs = list(freqs) if freqs is not None else default_freqs
+    qs = list(qs) if qs is not None else [1.0] * len(gains)
+    if not (len(gains) == len(freqs) == len(qs) == 8):
+        raise ValueError("eq_custom needs exactly 8 freq/gain/q values")
+    sb = ["BA31", _hex(slot_id), ""]
+    for freq, gain, q in zip(freqs, gains, qs):
+        g = int(gain * 10 + 120)
+        if not 0 <= g <= 240:
+            raise ValueError("gain out of range −12..+12 dB: " + str(gain))
+        sb.append(int(freq).to_bytes(2, "little").hex().upper())
+        sb.append(g.to_bytes(2, "little").hex().upper())
+        sb.append((int(q * 10) & 0xFFFF).to_bytes(2, "little").hex().upper())
+        sb.append(f"{int(filt):02X}00")
+    return "".join(sb)
 
 
 def spatial_query() -> str:
@@ -357,11 +395,19 @@ def decode(frame: str) -> str:
 
 
 def _decode_eq_ack(payload: str) -> str:
-    """AA30 <id> — preset selection ack (EarEqDefaultRegulationPresenter.j)."""
+    """AA30 <id> — preset select ack; the byte may instead be a failure code
+    (EarEqDefaultRegulationActivityNewUi.java:880-905: 00 generic fail (only
+    sent on '00' branch), 0C double-connect required, 0D in a call)."""
     try:
         pid = int(payload[:2], 16)
     except (ValueError, IndexError):
         return "EQ ack frame " + payload
+    if pid == 0x00:
+        return "EQ select failed (device unresponsive — retry)"
+    if pid == 0x0C:
+        return "EQ select rejected: connect both buds first"
+    if pid == 0x0D:
+        return "EQ select rejected: cannot set during a call"
     return f"EQ ack: preset {pid} selected ({eq_label(pid)})"
 
 
