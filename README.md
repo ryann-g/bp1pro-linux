@@ -19,7 +19,7 @@ gesture bindings, live battery for left bud / right bud / charging case.
 ## Install
 
 ```sh
-git clone https://github.com/dream-creator/bp1pro-linux.git
+git clone https://github.com/ryann-g/bp1pro-linux.git
 cd bp1pro-linux
 ./install-desktop.sh       # per-user, no sudo
 ```
